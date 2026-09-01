@@ -1,0 +1,124 @@
+name: Ibex Simple System
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  # Pin Ibex to a known-good commit for reproducibility.  Bump this when
+  # a newer Ibex revision is verified against xezim.
+  IBEX_REF: 8b8ee086aef72e0833b7f0493d9d33f1e4d3c8e2
+
+jobs:
+  ibex-simple-system:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # xezim-core is a git dependency in Cargo.toml (cargo clones it), but
+      # Cargo.lock is gitignored so it tracks a moving main — the build cache
+      # key still needs the core commit to avoid reusing a tree built against
+      # a different core.
+      - name: Resolve xezim-core HEAD
+        run: |
+          echo "CORE_SHA=$(git ls-remote https://github.com/aionhw/xezim-core.git refs/heads/main | cut -f1)" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargoreg-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargoreg-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: ${{ runner.os }}-target-ibex-${{ hashFiles('**/Cargo.toml') }}-${{ env.CORE_SHA }}
+
+      # ── Build xezim (release) ──────────────────────────────────────
+      - name: Build xezim
+        run: cargo build --release
+
+      # ── Install system dependencies ────────────────────────────────
+      # gcc-riscv64-unknown-elf: bare-metal RISC-V GCC for building firmware
+      # srecord: provides srec_cat for generating .vmem from .bin
+      - name: Install RISC-V toolchain and srecord
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf srecord
+
+      # FuseSoC resolves the Ibex RTL file list; pyyaml is needed by
+      # util/ibex_config.py to emit FuseSoC parameters.  uv installs
+      # into an isolated venv so the runner doesn't rely on the system
+      # Python package layout.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: latest
+
+      - name: Install FuseSoC and Python deps
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install fusesoc pyyaml
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      # ── Clone Ibex (pinned) ────────────────────────────────────────
+      - name: Cache Ibex checkout
+        id: cache-ibex
+        uses: actions/cache@v6
+        with:
+          path: ibex
+          key: ibex-${{ env.IBEX_REF }}
+
+      - name: Clone Ibex
+        if: steps.cache-ibex.outputs.cache-hit != 'true'
+        run: |
+          git init ibex
+          cd ibex
+          git remote add origin https://github.com/lowRISC/ibex.git
+          git fetch --depth 1 origin ${{ env.IBEX_REF }}
+          git checkout FETCH_HEAD
+
+      # ── Build hello_test firmware ──────────────────────────────────
+      # Override CC to use the 64-bit bare-metal GCC (it compiles rv32imc
+      # code with -march=rv32imc -mabi=ilp32 from common.mk).
+      - name: Build hello_test firmware
+        run: |
+          make -C ibex/examples/sw/simple_system/hello_test \
+            CC=riscv64-unknown-elf-gcc \
+            ARCH=rv32imc_zicsr \
+            CROSS_COMPILE=riscv64-unknown-elf-
+
+      # ── Compile and simulate ───────────────────────────────────────
+      # FuseSoC generates the VCS-style filelist; xezim compiles the Ibex
+      # RTL and runs the simple_system simulation.  The runner script
+      # verifies that "Hello simple system" appears in the simulation log.
+      - name: Compile and simulate Ibex simple_system with xezim
+        run: |
+          ./scripts/run_ibex_simple_system.sh
+        env:
+          IBEX_DIR: ${{ github.workspace }}/ibex
+          XEZIM: ${{ github.workspace }}/target/release/xezim
+
+      # Upload the simulation log and xezim stdout as artifacts so
+      # failed runs can be inspected without re-running the job.
+      - name: Upload simulation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibex-simulation-output
+          path: |
+            ibex/build/xezim/run/ibex_simple_system.log
+            ibex/build/xezim/run/xezim_stdout.log
+          if-no-files-found: ignore
+          retention-days: 14
