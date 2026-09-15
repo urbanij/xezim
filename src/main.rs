@@ -230,7 +230,7 @@ fn print_usage() {
     eprintln!("                   run can be replayed with +seed=<that value>");
     eprintln!("                   (same seed -> byte-identical run; affects e.g. the");
     eprintln!("                   number of packets a random UVM test collects)");
-    eprintln!("  -f/-c filelist   Recursive; options inside filelist are supported");
+    eprintln!("  -f/-F/-c filelist Recursive; options inside filelist are supported (-F: commercial-style flist-relative paths)");
 }
 
 fn print_version() {
@@ -661,7 +661,7 @@ fn process_command_file(
                     *nospecify = true;
                 }
                 "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {}
-                "-f" | "-c" => {
+                "-f" | "-F" | "-c" => {
                     i += 1;
                     if i < toks.len() {
                         let nested = resolve_rel(base, &toks[i]);
@@ -691,6 +691,22 @@ fn process_command_file(
                     lib_dirs.push(d.clone());
                     include_dirs.push(d);
                 }
+                _ if t.starts_with("-F") && t.len() > 2 => {
+                    let nested = resolve_rel(base, &t[2..]);
+                    process_command_file(
+                        &nested,
+                        source_files,
+                        include_dirs,
+                        defines,
+                        lib_dirs,
+                        plusargs,
+                        lib_files,
+                        lib_exts,
+                        nospecify,
+                        primitive_verbose,
+                        module_timescale_args,
+                    )?;
+                }
                 _ if t.starts_with("-f") && t.len() > 2 => {
                     let nested = resolve_rel(base, &t[2..]);
                     process_command_file(
@@ -708,7 +724,22 @@ fn process_command_file(
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
-                    push_plus_incdir(t, include_dirs);
+                    // Resolve each dir against THIS filelist's own
+                    // directory -- same rule as the -I/-y/-v arms above
+                    // and the same convention every commercial tool uses
+                    // for relative paths inside a -f/-c command file
+                    // (e.g. `+incdir+.` in dv/ocho_dv.flist means the
+                    // filelist's dir, not the process CWD). Only the
+                    // COMMAND-LINE +incdir+ arm (main.rs arg parsing)
+                    // stays CWD-relative.
+                    for dir in t["+incdir+".len()..].split('+').filter(|s| !s.is_empty()) {
+                        let pp = Path::new(dir);
+                        include_dirs.push(if pp.is_absolute() {
+                            dir.to_string()
+                        } else {
+                            base.join(pp).to_string_lossy().to_string()
+                        });
+                    }
                 }
                 "--primitive-verbose" => {
                     *primitive_verbose = true;
@@ -1613,7 +1644,7 @@ fn run_main() -> i32 {
                 top_module = Some(arg[2..].to_string());
                 top_modules.push(arg[2..].to_string());
             }
-            "-c" | "-f" => {
+            "-c" | "-f" | "-F" => {
                 i += 1;
                 if i < args.len() {
                     match process_command_file(
@@ -1634,6 +1665,27 @@ fn run_main() -> i32 {
                             eprintln!("{}", e);
                             std::process::exit(1);
                         }
+                    }
+                }
+            }
+            _ if arg.starts_with("-F") && arg.len() > 2 => {
+                match process_command_file(
+                    &arg[2..],
+                    &mut source_files,
+                    &mut include_dirs,
+                    &mut defines,
+                    &mut lib_dirs,
+                    &mut plusargs,
+                    &mut lib_files,
+                    &mut lib_exts,
+                    &mut nospecify,
+                    &mut primitive_verbose,
+                    &mut module_timescale_args,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
                     }
                 }
             }
